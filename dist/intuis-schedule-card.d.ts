@@ -27,7 +27,11 @@ export declare class IntuisScheduleCard extends LitElement {
      */
     private _handleTimeChange;
     /**
-     * Apply the block edit
+     * Handle day change in editor
+     */
+    private _handleDayChange;
+    /**
+     * Apply the block edit - supports multi-day spans
      */
     private _applyEdit;
     /**

@@ -30,9 +30,11 @@ interface ScheduleBlock {
 // Editor state for time range editing
 interface BlockEditorState {
   open: boolean;
-  day: DayOfWeek | null;
-  dayIndex: number;
   block: ScheduleBlock | null;
+  startDay: DayOfWeek | null;
+  startDayIndex: number;
+  endDay: DayOfWeek | null;
+  endDayIndex: number;
   startTime: string;
   endTime: string;
   selectedZoneId: number | null;
@@ -46,9 +48,11 @@ export class IntuisScheduleCard extends LitElement {
   @state() private _error?: string;
   @state() private _editor: BlockEditorState = {
     open: false,
-    day: null,
-    dayIndex: 0,
     block: null,
+    startDay: null,
+    startDayIndex: 0,
+    endDay: null,
+    endDayIndex: 0,
     startTime: '',
     endTime: '',
     selectedZoneId: null,
@@ -149,11 +153,14 @@ export class IntuisScheduleCard extends LitElement {
    * Handle block click - open editor
    */
   private _handleBlockClick(day: DayOfWeek, block: ScheduleBlock): void {
+    const dayIndex = DAY_INDEX[day];
     this._editor = {
       open: true,
-      day,
-      dayIndex: DAY_INDEX[day],
       block,
+      startDay: day,
+      startDayIndex: dayIndex,
+      endDay: day,
+      endDayIndex: dayIndex,
       startTime: block.startTime,
       endTime: block.endTime === '00:00' ? '24:00' : block.endTime,
       selectedZoneId: block.zone.id,
@@ -175,35 +182,89 @@ export class IntuisScheduleCard extends LitElement {
   }
 
   /**
-   * Apply the block edit
+   * Handle day change in editor
+   */
+  private _handleDayChange(field: 'start' | 'end', dayIndex: number): void {
+    const day = DAYS_OF_WEEK[dayIndex];
+    if (field === 'start') {
+      this._editor = { ...this._editor, startDay: day, startDayIndex: dayIndex };
+    } else {
+      this._editor = { ...this._editor, endDay: day, endDayIndex: dayIndex };
+    }
+  }
+
+  /**
+   * Apply the block edit - supports multi-day spans
    */
   private async _applyEdit(): Promise<void> {
-    if (!this.hass || !this._editor.day || this._editor.selectedZoneId === null) return;
+    if (!this.hass || !this._editor.startDay || this._editor.selectedZoneId === null) return;
 
     this._loading = true;
     this._error = undefined;
 
     try {
-      // Call service to set the zone at the start time
-      await this.hass.callService('intuis_connect', 'set_schedule_slot', {
-        day: this._editor.dayIndex,
-        start_time: this._editor.startTime,
-        zone_id: this._editor.selectedZoneId,
-      });
+      const startDayIdx = this._editor.startDayIndex;
+      const endDayIdx = this._editor.endDayIndex;
+      const zoneId = this._editor.selectedZoneId;
+      const originalZoneId = this._editor.block?.zone.id;
 
-      // If end time is different from original block's end time,
-      // we need to set what comes after this block
-      const originalEndTime = this._editor.block?.endTime === '00:00' ? '24:00' : this._editor.block?.endTime;
-      const newEndTime = this._editor.endTime === '00:00' ? '24:00' : this._editor.endTime;
+      // Handle wrap-around (e.g., Friday to Monday)
+      const spansDays = startDayIdx !== endDayIdx ||
+        (this._editor.startTime > this._editor.endTime && this._editor.endTime !== '24:00');
 
-      if (originalEndTime && newEndTime && newEndTime !== originalEndTime && newEndTime !== '24:00') {
-        // Restore the original zone at the new end time
-        // This handles the case where user shortens a block
-        if (this._editor.block?.zone.id) {
+      if (!spansDays) {
+        // Single day edit
+        await this.hass.callService('intuis_connect', 'set_schedule_slot', {
+          day: startDayIdx,
+          start_time: this._editor.startTime,
+          zone_id: zoneId,
+        });
+
+        // Restore original zone at end time if needed
+        const endTime = this._editor.endTime === '00:00' ? '24:00' : this._editor.endTime;
+        if (endTime !== '24:00' && originalZoneId) {
           await this.hass.callService('intuis_connect', 'set_schedule_slot', {
-            day: this._editor.dayIndex,
+            day: startDayIdx,
             start_time: this._editor.endTime,
-            zone_id: this._editor.block.zone.id,
+            zone_id: originalZoneId,
+          });
+        }
+      } else {
+        // Multi-day span
+        // 1. Set zone at start day/time
+        await this.hass.callService('intuis_connect', 'set_schedule_slot', {
+          day: startDayIdx,
+          start_time: this._editor.startTime,
+          zone_id: zoneId,
+        });
+
+        // 2. Set zone at 00:00 for each intermediate day
+        let currentDay = (startDayIdx + 1) % 7;
+        while (currentDay !== endDayIdx) {
+          await this.hass.callService('intuis_connect', 'set_schedule_slot', {
+            day: currentDay,
+            start_time: '00:00',
+            zone_id: zoneId,
+          });
+          currentDay = (currentDay + 1) % 7;
+        }
+
+        // 3. Set zone at 00:00 for end day, then restore original zone at end time
+        if (endDayIdx !== startDayIdx) {
+          await this.hass.callService('intuis_connect', 'set_schedule_slot', {
+            day: endDayIdx,
+            start_time: '00:00',
+            zone_id: zoneId,
+          });
+        }
+
+        // Restore original zone at end time (if not end of day)
+        const endTime = this._editor.endTime === '00:00' ? '24:00' : this._editor.endTime;
+        if (endTime !== '24:00' && endTime !== '00:00' && originalZoneId) {
+          await this.hass.callService('intuis_connect', 'set_schedule_slot', {
+            day: endDayIdx,
+            start_time: this._editor.endTime,
+            zone_id: originalZoneId,
           });
         }
       }
@@ -222,9 +283,11 @@ export class IntuisScheduleCard extends LitElement {
   private _closeEditor(): void {
     this._editor = {
       open: false,
-      day: null,
-      dayIndex: 0,
       block: null,
+      startDay: null,
+      startDayIndex: 0,
+      endDay: null,
+      endDayIndex: 0,
       startTime: '',
       endTime: '',
       selectedZoneId: null,
@@ -373,36 +436,59 @@ export class IntuisScheduleCard extends LitElement {
   }
 
   private _renderEditor(attrs: ScheduleSummaryAttributes): TemplateResult {
+    const shortDays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
     return html`
       <div class="editor-overlay" @click=${this._closeEditor}>
         <div class="editor" @click=${(e: Event) => e.stopPropagation()}>
           <div class="editor-header">
             <span class="editor-title">Edit Schedule</span>
-            <span class="editor-day">${this._editor.day}</span>
           </div>
 
-          <div class="editor-times">
+          <div class="editor-row">
             <div class="editor-section">
-              <label>Start Time</label>
-              <input
-                type="text"
-                class="time-input"
-                placeholder="HH:MM"
-                pattern="[0-2][0-9]:[0-5][0-9]"
-                .value=${this._editor.startTime}
-                @input=${(e: Event) => this._handleTimeChange('startTime', (e.target as HTMLInputElement).value)}
-              />
+              <label>From</label>
+              <div class="day-time-input">
+                <select
+                  class="day-select"
+                  .value=${String(this._editor.startDayIndex)}
+                  @change=${(e: Event) => this._handleDayChange('start', parseInt((e.target as HTMLSelectElement).value))}
+                >
+                  ${shortDays.map((day, idx) => html`
+                    <option value=${idx} ?selected=${idx === this._editor.startDayIndex}>${day}</option>
+                  `)}
+                </select>
+                <input
+                  type="text"
+                  class="time-input"
+                  placeholder="HH:MM"
+                  pattern="[0-2][0-9]:[0-5][0-9]"
+                  .value=${this._editor.startTime}
+                  @input=${(e: Event) => this._handleTimeChange('startTime', (e.target as HTMLInputElement).value)}
+                />
+              </div>
             </div>
             <div class="editor-section">
-              <label>End Time</label>
-              <input
-                type="text"
-                class="time-input"
-                placeholder="HH:MM"
-                pattern="[0-2][0-9]:[0-5][0-9]"
-                .value=${this._editor.endTime}
-                @input=${(e: Event) => this._handleTimeChange('endTime', (e.target as HTMLInputElement).value)}
-              />
+              <label>To</label>
+              <div class="day-time-input">
+                <select
+                  class="day-select"
+                  .value=${String(this._editor.endDayIndex)}
+                  @change=${(e: Event) => this._handleDayChange('end', parseInt((e.target as HTMLSelectElement).value))}
+                >
+                  ${shortDays.map((day, idx) => html`
+                    <option value=${idx} ?selected=${idx === this._editor.endDayIndex}>${day}</option>
+                  `)}
+                </select>
+                <input
+                  type="text"
+                  class="time-input"
+                  placeholder="HH:MM"
+                  pattern="[0-2][0-9]:[0-5][0-9]"
+                  .value=${this._editor.endTime}
+                  @input=${(e: Event) => this._handleTimeChange('endTime', (e.target as HTMLInputElement).value)}
+                />
+              </div>
             </div>
           </div>
 
@@ -618,13 +704,34 @@ export class IntuisScheduleCard extends LitElement {
       color: var(--secondary-text-color);
     }
 
-    .editor-times {
+    .editor-row {
       display: flex;
       gap: 16px;
     }
 
-    .editor-times .editor-section {
+    .editor-row .editor-section {
       flex: 1;
+    }
+
+    .day-time-input {
+      display: flex;
+      gap: 8px;
+    }
+
+    .day-select {
+      padding: 10px;
+      border: 1px solid var(--divider-color);
+      border-radius: 8px;
+      font-size: 1em;
+      background: var(--card-background-color);
+      color: var(--primary-text-color);
+      cursor: pointer;
+      min-width: 70px;
+    }
+
+    .day-select:focus {
+      outline: none;
+      border-color: var(--primary-color);
     }
 
     .editor-section {
@@ -640,7 +747,8 @@ export class IntuisScheduleCard extends LitElement {
     }
 
     .time-input {
-      width: 100%;
+      flex: 1;
+      min-width: 70px;
       padding: 10px;
       border: 1px solid var(--divider-color);
       border-radius: 8px;
@@ -650,6 +758,11 @@ export class IntuisScheduleCard extends LitElement {
       background: var(--card-background-color);
       color: var(--primary-text-color);
       box-sizing: border-box;
+    }
+
+    .time-input:focus {
+      outline: none;
+      border-color: var(--primary-color);
     }
 
     .zone-options {
